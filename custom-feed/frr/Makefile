@@ -168,8 +168,8 @@ define Build/Configure
 	--prefix=/usr \
 	--enable-shared \
 	--disable-static \
-	--enable-user=network \
-	--enable-group=network \
+	--enable-user=root \
+	--enable-group=root \
 	--enable-multipath=16 \
 	--disable-capabilities \
 	--disable-ospfclient \
