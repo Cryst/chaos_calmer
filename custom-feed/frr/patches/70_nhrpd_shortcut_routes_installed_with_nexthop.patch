@@ -1,0 +1,65 @@
+From ef91ff04681ff3a7d17b985a02003ed308a363ab Mon Sep 17 00:00:00 2001
+From: Philippe Guibert <philippe.guibert@6wind.com>
+Date: Thu, 23 Jul 2020 08:57:05 +0200
+Subject: [PATCH] nhrpd: shortcut routes installed with nexthop.
+
+Previously, when a shortcut entry was created, its associated route was
+created on system, with no nexthop, only gre device. eg:
+
+[..]
+N>* 192.168.2.0/24 [10/0] is directly connected, gre1, 00:01:04           <--- can not be resolved
+
+[..]
+Type     Prefix                   Via                      Identity
+dynamic  192.168.2.0/24           10.255.255.2             				<---- correct
+
+This situation was forcing neighbor resolution on the first outgoing packet matching the route entry. for instance 192.168.2.1 could not be resolved at link layer, and was going to fail. Instead, nhrp nexthop should have been used.
+This is what this commit intends to do, that is to say that when a
+shortcut is installed by nhrp, the associated nexthop entry is used.
+
+[..]
+N>* 192.168.2.0/24 [10/0] via 10.255.255.2, gre1 onlink, 00:00:31
+
+Signed-off-by: Philippe Guibert <philippe.guibert@6wind.com>
+---
+ nhrpd/nhrp_shortcut.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/nhrpd/nhrp_shortcut.c b/nhrpd/nhrp_shortcut.c
+index 6ad0c9ea039..fbb883185ae 100644
+--- a/nhrpd/nhrp_shortcut.c
++++ b/nhrpd/nhrp_shortcut.c
+@@ -54,21 +54,26 @@
+ 				       unsigned long cmd)
+ {
+ 	char buf[PREFIX_STRLEN];
++	char buf2[PREFIX_STRLEN];
+ 
+ 	struct nhrp_shortcut *s =
+ 		container_of(n, struct nhrp_shortcut, cache_notifier);
++	struct nhrp_cache *c = s->cache;
+ 
++	if (c)
++		sockunion2str(&c->remote_addr, buf2, sizeof(buf2));
++	else
++		snprintf(buf2, sizeof(buf2), "(unspec)");
+ 	switch (cmd) {
+ 	case NOTIFY_CACHE_UP:
+ 		if (!s->route_installed) {
+ 			debugf(NHRP_DEBUG_ROUTE,
+-			       "Shortcut: route install "
+-			       "%s nh (unspec) dev %s",
+-			       prefix2str(s->p, buf, sizeof(buf)),
+-			       s->cache->ifp->name);
++			       "Shortcut: route install %pFX nh %s dev %s",
++			       s->p, buf2, c && c->ifp ?
++			       c->ifp->name : "<unk>");
+ 
+-			nhrp_route_announce(1, s->type, s->p, s->cache->ifp,
+-					    NULL, 0);
++			nhrp_route_announce(1, s->type, s->p, c ? c->ifp : NULL,
++					    c ? &c->remote_addr : NULL, 0);
+ 			s->route_installed = 1;
+ 		}
+ 		break;
+

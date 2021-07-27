@@ -1,0 +1,326 @@
+From 912c556b3a0354f37328f52108777e434307e339 Mon Sep 17 00:00:00 2001
+From: Ghasem Naddaf <ghasem.naddaf@gmail.com>
+Date: Thu, 27 Feb 2020 11:37:37 -0800
+Subject: [PATCH] nhrpd: route update support for natoa nbma
+
+nhrp_cache_update_route, nhrp_cache_authorize_binding: Fix route update for NAT scenario. When remote_nbma_natoa is already set in the cache entry, binding should be updated to this value and not vc remote nbma, which would be different from the NATted address.
+
+nhrp_shortcut_recv_resolution_rep: Simplify the logic for finding the natoa nbma. Also, install shortcut entries as DYNAMIC type, as suggested in Section 6.2.2 of RFC2332.
+
+nhrp_shortcut_cache_notify: announce the installed route with the correct interface from cache.
+
+Signed-off-by: Ghasem Naddaf <gshirazi@infoblox.com>
+---
+ nhrpd/nhrp_cache.c    | 90 +++++++++++++++++++++++++++++++++++++++++--
+ nhrpd/nhrp_shortcut.c | 86 ++++++++++++++++++++++++++++++++---------
+ 2 files changed, 153 insertions(+), 23 deletions(-)
+
+diff --git a/nhrpd/nhrp_cache.c b/nhrpd/nhrp_cache.c
+index cc18b36f6ae..ad478bab97b 100644
+--- a/nhrpd/nhrp_cache.c
++++ b/nhrpd/nhrp_cache.c
+@@ -119,12 +119,47 @@ static void nhrp_cache_update_route(struct nhrp_cache *c)
+ {
+ 	struct prefix pfx;
+ 	struct nhrp_peer *p = c->cur.peer;
++	char buf[3][SU_ADDRSTRLEN];
++	struct nhrp_interface *nifp;
+ 
+ 	sockunion2hostprefix(&c->remote_addr, &pfx);
+ 
+ 	if (p && nhrp_peer_check(p, 1)) {
+-		netlink_update_binding(p->ifp, &c->remote_addr,
+-				       &p->vc->remote.nbma);
++		if (sockunion_family(&c->cur.remote_nbma_natoa) != AF_UNSPEC) {
++			/* remote_nbma_natoa is already set. Therefore, binding
++			 * should be updated to this value and not vc's remote
++			 * nbma.
++			 */
++			debugf(NHRP_DEBUG_COMMON,
++			       "cache (peer check ok, remote_nbma_natoa is set): "
++			       "Update binding for %s dev %s from (deleted) "
++			       "peer.vc.nbma %s to %s",
++			       sockunion2str(&c->remote_addr, buf[0],
++					     sizeof(buf[0])),
++			       p->ifp->name,
++			       sockunion2str(&p->vc->remote.nbma, buf[1],
++					     sizeof(buf[1])),
++			       sockunion2str(&c->cur.remote_nbma_natoa, buf[2],
++					     sizeof(buf[2])));
++
++			netlink_update_binding(p->ifp, &c->remote_addr,
++					       &c->cur.remote_nbma_natoa);
++		} else {
++			// update binding to peer->vc->remote->nbma
++			debugf(NHRP_DEBUG_COMMON,
++			       "cache (peer check ok, remote_nbma_natoa unspec): "
++			       "Update binding for %s dev %s from (deleted) "
++			       "to peer.vc.nbma %s",
++			       sockunion2str(&c->remote_addr, buf[0],
++					     sizeof(buf[0])),
++			       p->ifp->name,
++			       sockunion2str(&p->vc->remote.nbma, buf[1],
++					     sizeof(buf[1])));
++
++			netlink_update_binding(p->ifp, &c->remote_addr,
++					       &p->vc->remote.nbma);
++		}
++
+ 		nhrp_route_announce(1, c->cur.type, &pfx, c->ifp, NULL,
+ 				    c->cur.mtu);
+ 		if (c->cur.type >= NHRP_CACHE_DYNAMIC) {
+@@ -139,6 +174,18 @@ static void nhrp_cache_update_route(struct nhrp_cache *c)
+ 			c->route_installed = 1;
+ 		}
+ 	} else {
++		// debug the reason for peer check fail
++		if (p) {
++			nifp = p->ifp->info;
++			debugf(NHRP_DEBUG_COMMON,
++			       "cache (peer check failed: "
++			       "online?%d requested?%d ipsec?%d)",
++			       p->online, p->requested,
++			       nifp->ipsec_profile ? 1 : 0);
++		} else
++			debugf(NHRP_DEBUG_COMMON,
++			       "cache (peer check failed: no p)");
++
+ 		if (c->nhrp_route_installed) {
+ 			nhrp_route_update_nhrp(&pfx, NULL);
+ 			c->nhrp_route_installed = 0;
+@@ -207,10 +254,10 @@ static void nhrp_cache_update_timers(struct nhrp_cache *c)
+ static void nhrp_cache_authorize_binding(struct nhrp_reqid *r, void *arg)
+ {
+ 	struct nhrp_cache *c = container_of(r, struct nhrp_cache, eventid);
+-	char buf[SU_ADDRSTRLEN];
++	char buf[3][SU_ADDRSTRLEN];
+ 
+ 	debugf(NHRP_DEBUG_COMMON, "cache: %s %s: %s", c->ifp->name,
+-	       sockunion2str(&c->remote_addr, buf, sizeof buf),
++	       sockunion2str(&c->remote_addr, buf[0], sizeof buf[0]),
+ 	       (const char *)arg);
+ 
+ 	nhrp_reqid_free(&nhrp_event_reqid, r);
+@@ -230,6 +277,26 @@ static void nhrp_cache_authorize_binding(struct nhrp_reqid *r, void *arg)
+ 		if (c->cur.peer)
+ 			nhrp_peer_notify_add(c->cur.peer, &c->peer_notifier,
+ 					     nhrp_cache_peer_notifier);
++
++		if (sockunion_family(&c->cur.remote_nbma_natoa) != AF_UNSPEC) {
++			debugf(NHRP_DEBUG_COMMON,
++			       "cache: update binding for %s dev %s from "
++			       "(deleted) peer.vc.nbma %s to %s",
++			       sockunion2str(&c->remote_addr, buf[0],
++					     sizeof buf[0]),
++			       c->ifp->name,
++			       (c->cur.peer ? sockunion2str(
++					&c->cur.peer->vc->remote.nbma, buf[1],
++					sizeof buf[1])
++					    : "(no peer)"),
++			       sockunion2str(&c->cur.remote_nbma_natoa, buf[2],
++					     sizeof buf[2]));
++
++			netlink_update_binding(c->cur.peer->ifp,
++					       &c->remote_addr,
++					       &c->cur.remote_nbma_natoa);
++		}
++
+ 		nhrp_cache_update_route(c);
+ 		notifier_call(&c->notifier_list, NOTIFY_CACHE_BINDING_CHANGE);
+ 	} else {
+@@ -273,6 +340,7 @@ int nhrp_cache_update_binding(struct nhrp_cache *c, enum nhrp_cache_type type,
+ 			      int holding_time, struct nhrp_peer *p,
+ 			      uint32_t mtu, union sockunion *nbma_oa)
+ {
++	char buf[2][SU_ADDRSTRLEN];
+ 	if (c->cur.type > type || c->new.type > type) {
+ 		nhrp_peer_unref(p);
+ 		return 0;
+@@ -293,8 +361,16 @@ int nhrp_cache_update_binding(struct nhrp_cache *c, enum nhrp_cache_type type,
+ 		break;
+ 	}
+ 
++	sockunion2str(&c->cur.remote_nbma_natoa, buf[0], sizeof(buf[0]));
++	if (nbma_oa)
++		sockunion2str(nbma_oa, buf[1], sizeof(buf[1]));
++
+ 	nhrp_cache_reset_new(c);
+ 	if (c->cur.type == type && c->cur.peer == p && c->cur.mtu == mtu) {
++		debugf(NHRP_DEBUG_COMMON,
++		       "cache: same type %u, updating "
++		       "expiry and changing nbma addr from %s to %s",
++		       type, buf[0], nbma_oa ? buf[1] : "(NULL)");
+ 		if (holding_time > 0)
+ 			c->cur.expires = monotime(NULL) + holding_time;
+ 		if (nbma_oa)
+@@ -304,6 +380,12 @@ int nhrp_cache_update_binding(struct nhrp_cache *c, enum nhrp_cache_type type,
+ 			       sizeof c->cur.remote_nbma_natoa);
+ 		nhrp_peer_unref(p);
+ 	} else {
++		debugf(NHRP_DEBUG_COMMON,
++		       "cache: new type %u/%u, or peer %s, "
++		       "or mtu %u/%u, nbma %s --> %s (map %d)",
++		       c->cur.type, type, (c->cur.peer == p) ? "same" : "diff",
++		       c->cur.mtu, mtu, buf[0], nbma_oa ? buf[1] : "(NULL)",
++		       c->map);
+ 		c->new.type = type;
+ 		c->new.peer = p;
+ 		c->new.mtu = mtu;
+diff --git a/nhrpd/nhrp_shortcut.c b/nhrpd/nhrp_shortcut.c
+index 1f83b793afe..cd53a391c18 100644
+--- a/nhrpd/nhrp_shortcut.c
++++ b/nhrpd/nhrp_shortcut.c
+@@ -53,14 +53,22 @@ static int nhrp_shortcut_do_expire(struct thread *t)
+ static void nhrp_shortcut_cache_notify(struct notifier_block *n,
+ 				       unsigned long cmd)
+ {
++	char buf[PREFIX_STRLEN];
++
+ 	struct nhrp_shortcut *s =
+ 		container_of(n, struct nhrp_shortcut, cache_notifier);
+ 
+ 	switch (cmd) {
+ 	case NOTIFY_CACHE_UP:
+ 		if (!s->route_installed) {
+-			nhrp_route_announce(1, s->type, s->p, NULL,
+-					    &s->cache->remote_addr, 0);
++			debugf(NHRP_DEBUG_ROUTE,
++			       "Shortcut: route install "
++			       "%s nh (unspec) dev %s",
++			       prefix2str(s->p, buf, sizeof(buf)),
++			       s->cache->ifp->name);
++
++			nhrp_route_announce(1, s->type, s->p, s->cache->ifp,
++					    NULL, 0);
+ 			s->route_installed = 1;
+ 		}
+ 		break;
+@@ -84,6 +92,8 @@ static void nhrp_shortcut_update_binding(struct nhrp_shortcut *s,
+ 					 enum nhrp_cache_type type,
+ 					 struct nhrp_cache *c, int holding_time)
+ {
++	char buf[2][PREFIX_STRLEN];
++
+ 	s->type = type;
+ 	if (c != s->cache) {
+ 		if (s->cache) {
+@@ -98,13 +108,32 @@ static void nhrp_shortcut_update_binding(struct nhrp_shortcut *s,
+ 				/* Force renewal of Zebra announce on prefix
+ 				 * change */
+ 				s->route_installed = 0;
++				debugf(NHRP_DEBUG_ROUTE,
++				       "Shortcut: forcing route install to "
++				       "announce prefix change for peer %s "
++				       "ht %u cur nbma %s dev %s",
++				       sockunion2str(&s->cache->remote_addr,
++						     buf[0], sizeof(buf[0])),
++				       holding_time,
++				       sockunion2str(
++					       &s->cache->cur.remote_nbma_natoa,
++					       buf[1], sizeof(buf[1])),
++				       s->cache->ifp->name);
+ 				nhrp_shortcut_cache_notify(&s->cache_notifier,
+ 							   NOTIFY_CACHE_UP);
+ 			}
+ 		}
+-		if (!s->cache || !s->cache->route_installed)
++		if (!s->cache || !s->cache->route_installed) {
++			debugf(NHRP_DEBUG_ROUTE,
++			       "Shortcut: notify cache down "
++			       "because cache?%s or ri?%s",
++			       s->cache ? "yes" : "no",
++			       s->cache ? (s->cache->route_installed ? "yes"
++								     : "no")
++					: "n/a");
+ 			nhrp_shortcut_cache_notify(&s->cache_notifier,
+ 						   NOTIFY_CACHE_DOWN);
++		}
+ 	}
+ 	if (s->type == NHRP_CACHE_NEGATIVE && !s->route_installed) {
+ 		nhrp_route_announce(1, s->type, s->p, NULL, NULL, 0);
+@@ -190,11 +220,10 @@ static void nhrp_shortcut_recv_resolution_rep(struct nhrp_reqid *reqid,
+ 	struct nhrp_extension_header *ext;
+ 	struct nhrp_cie_header *cie;
+ 	struct nhrp_cache *c = NULL;
+-	union sockunion *proto, cie_proto, *nbma, *nbma_natoa, cie_nbma,
+-		nat_nbma;
++	union sockunion *proto, cie_proto, *nbma, cie_nbma, nat_nbma;
+ 	struct prefix prefix, route_prefix;
+ 	struct zbuf extpl;
+-	char bufp[PREFIX_STRLEN], buf[3][SU_ADDRSTRLEN];
++	char bufp[PREFIX_STRLEN], buf[4][SU_ADDRSTRLEN];
+ 	int holding_time = pp->if_ad->holdtime;
+ 
+ 	nhrp_reqid_free(&nhrp_packet_reqid, &s->reqid);
+@@ -262,39 +291,58 @@ static void nhrp_shortcut_recv_resolution_rep(struct nhrp_reqid *reqid,
+ 	}
+ 
+ 	debugf(NHRP_DEBUG_COMMON,
+-	       "Shortcut: %s is at proto %s cie-nbma %s nat-nbma %s cie-holdtime %d",
++	       "Shortcut: %s is at proto %s dst_proto %s cie-nbma %s nat-nbma "
++	       "%s cie-holdtime %d",
+ 	       prefix2str(&prefix, bufp, sizeof bufp),
+-	       sockunion2str(proto, buf[0], sizeof buf[0]),
+-	       sockunion2str(&cie_nbma, buf[1], sizeof buf[1]),
+-	       sockunion2str(&nat_nbma, buf[2], sizeof buf[2]),
++	       sockunion2str(proto, buf[0], sizeof(buf[0])),
++	       sockunion2str(&pp->dst_proto, buf[1], sizeof(buf[1])),
++	       sockunion2str(&cie_nbma, buf[2], sizeof(buf[2])),
++	       sockunion2str(&nat_nbma, buf[3], sizeof(buf[3])),
+ 	       htons(cie->holding_time));
+ 
+ 	/* Update cache entry for the protocol to nbma binding */
+-	if (sockunion_family(&nat_nbma) != AF_UNSPEC) {
++	if (sockunion_family(&nat_nbma) != AF_UNSPEC)
+ 		nbma = &nat_nbma;
+-		nbma_natoa = &cie_nbma;
+-	} else {
++	else
+ 		nbma = &cie_nbma;
+-		nbma_natoa = NULL;
+-	}
++
+ 	if (sockunion_family(nbma)) {
+ 		c = nhrp_cache_get(pp->ifp, proto, 1);
+ 		if (c) {
+-			nhrp_cache_update_binding(c, NHRP_CACHE_CACHED,
++			debugf(NHRP_DEBUG_COMMON,
++			       "Shortcut: cache found, update binding");
++			nhrp_cache_update_binding(c, NHRP_CACHE_DYNAMIC,
+ 						  holding_time,
+ 						  nhrp_peer_get(pp->ifp, nbma),
+-						  htons(cie->mtu), nbma_natoa);
++						  htons(cie->mtu), nbma);
++		} else {
++			debugf(NHRP_DEBUG_COMMON,
++			       "Shortcut: no cache for nbma %s", buf[2]);
+ 		}
+ 	}
+ 
+ 	/* Update shortcut entry for subnet to protocol gw binding */
+-	if (c && !sockunion_same(proto, &pp->dst_proto)) {
++	if (c) {
+ 		ps = nhrp_shortcut_get(&prefix);
+ 		if (ps) {
+ 			ps->addr = s->addr;
+-			nhrp_shortcut_update_binding(ps, NHRP_CACHE_CACHED, c,
++			debugf(NHRP_DEBUG_COMMON,
++			       "Shortcut: "
++			       "calling nhrp_shortcut_update_binding");
++			nhrp_shortcut_update_binding(ps, NHRP_CACHE_DYNAMIC, c,
+ 						     holding_time);
++		} else {
++			debugf(NHRP_DEBUG_COMMON,
++			       "Shortcut: proto diff but no ps");
+ 		}
++	} else {
++		debugf(NHRP_DEBUG_COMMON,
++		       "NO Shortcut because c NULL?%s or "
++		       "same proto?%s",
++		       c ? "no" : "yes",
++		       proto && pp && sockunion_same(proto, &pp->dst_proto)
++			       ? "yes"
++			       : "no");
+ 	}
+ 
+ 	debugf(NHRP_DEBUG_COMMON, "Shortcut: Resolution reply handled");
