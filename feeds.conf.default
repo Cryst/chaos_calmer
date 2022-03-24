@@ -12,4 +12,4 @@ src-git management https://github.com/openwrt-management/packages.git;for-15.05
 #src-svn desktop svn://svn.openwrt.org/openwrt/feeds/desktop
 #src-svn xfce svn://svn.openwrt.org/openwrt/feeds/xfce
 #src-svn lxde svn://svn.openwrt.org/openwrt/feeds/lxde
-src-link custom /home/artur/dmvpn/chaos_calmer/custom-feed
+src-link custom ../custom-feed
